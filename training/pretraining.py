@@ -43,6 +43,17 @@ from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.utils.versions import require_version
 from transformers.integrations import is_deepspeed_zero3_enabled
 
+from training.utils import (
+    SavePeftModelTrainer,
+    save_model,
+    save_model_zero3,
+    print_trainable_parameters,
+    find_all_linear_names,
+    setup_tokenizer,
+    build_quantization_config,
+    load_jsonl_datasets,
+)
+
 
 @dataclass
 class ModelArguments:
@@ -277,78 +288,6 @@ class GroupTextsBuilder:
         return result
 
 
-class SavePeftModelTrainer(Trainer):
-    """
-    Trainer for lora models
-    """
-
-    def save_model(self, output_dir=None, _internal_call=False):
-        """Save the LoRA model."""
-        os.makedirs(output_dir, exist_ok=True)
-        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
-        self.model.save_pretrained(output_dir)
-
-
-def save_model(model, tokenizer, args):
-    """Save the model and the tokenizer."""
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Take care of distributed/parallel training
-    model_to_save = model.module if hasattr(model, "module") else model
-    model_to_save.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-
-
-def save_model_zero3(model, tokenizer, args, trainer):
-    """Save the model for deepspeed zero3.
-    refer https://github.com/lm-sys/FastChat/blob/main/fastchat/train/train_lora.py#L209
-    """
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-    state_dict_zero3 = trainer.model_wrapped._zero3_consolidated_16bit_state_dict()
-    model_to_save = model.module if hasattr(model, "module") else model
-    model_to_save.save_pretrained(args.output_dir, state_dict=state_dict_zero3)
-    tokenizer.save_pretrained(output_dir)
-
-
-def print_trainable_parameters(model):
-    """
-    Prints the number of trainable parameters in the model.
-    """
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    logger.info(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
-    )
-
-
-def find_all_linear_names(peft_model, int4=False, int8=False):
-    """Find all linear layer names in the model. reference from qlora paper."""
-    cls = torch.nn.Linear
-    if int4 or int8:
-        import bitsandbytes as bnb
-        if int4:
-            cls = bnb.nn.Linear4bit
-        elif int8:
-            cls = bnb.nn.Linear8bitLt
-    lora_module_names = set()
-    for name, module in peft_model.named_modules():
-        if isinstance(module, cls):
-            # last layer is not add to lora_module_names
-            if 'lm_head' in name:
-                continue
-            if 'output_layer' in name:
-                continue
-            names = name.split('.')
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-    return sorted(lora_module_names)
-
-
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, Seq2SeqTrainingArguments, ScriptArguments))
     model_args, data_args, training_args, script_args = parser.parse_args_into_dataclasses(
@@ -382,6 +321,7 @@ def main():
     tokenizer_name_or_path = model_args.tokenizer_name_or_path
     if not tokenizer_name_or_path:
         tokenizer_name_or_path = model_args.model_name_or_path
+    # 下载 tokenizer 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, **tokenizer_kwargs)
 
     if data_args.block_size is None:
@@ -615,7 +555,7 @@ def main():
         logger.debug("Tokenized eval example:")
         logger.debug(tokenizer.decode(eval_dataset[0]['input_ids']))
 
-    # Load model
+    # 载入模型
     if model_args.model_name_or_path:
         torch_dtype = (
             model_args.torch_dtype
@@ -640,28 +580,12 @@ def main():
         config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
         load_in_4bit = model_args.load_in_4bit
         load_in_8bit = model_args.load_in_8bit
-        if load_in_4bit and load_in_8bit:
-            raise ValueError("Error, load_in_4bit and load_in_8bit cannot be set at the same time")
-        elif load_in_8bit or load_in_4bit:
-            logger.info(f"Quantizing model, load_in_4bit: {load_in_4bit}, load_in_8bit: {load_in_8bit}")
+        quantization_config = build_quantization_config(load_in_4bit, load_in_8bit, torch_dtype, script_args.qlora)
+        if quantization_config is not None:
             if is_deepspeed_zero3_enabled():
                 raise ValueError("DeepSpeed ZeRO-3 is incompatible with quantization.")
-            if load_in_8bit:
-                config_kwargs['quantization_config'] = BitsAndBytesConfig(load_in_8bit=True)
-            elif load_in_4bit:
-                if script_args.qlora:
-                    config_kwargs['quantization_config'] = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_use_double_quant=True,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_compute_dtype=torch_dtype,
-                    )
-                else:
-                    config_kwargs['quantization_config'] = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch_dtype,
-                    )
-
+            config_kwargs['quantization_config'] = quantization_config
+        # 自动载入模型
         model = AutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             config=config,
@@ -783,9 +707,9 @@ def main():
             logger.debug(f"Training metrics: {metrics}")
             logger.info(f"Saving model checkpoint to {training_args.output_dir}")
             if is_deepspeed_zero3_enabled():
-                save_model_zero3(model, tokenizer, training_args, trainer)
+                save_model_zero3(model, tokenizer, training_args.output_dir, trainer)
             else:
-                save_model(model, tokenizer, training_args)
+                save_model(model, tokenizer, training_args.output_dir)
 
     # Evaluation
     if training_args.do_eval:

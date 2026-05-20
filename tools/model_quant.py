@@ -24,11 +24,13 @@ def parse_args():
 
 # 计算模型相关的显存占用
 def get_model_memory_usage(device):
-    return torch.cuda.memory_allocated(device) / (1024 ** 3)  # 转换为GB
+    if device == "cuda" or (isinstance(device, int) and device >= 0):
+        return torch.cuda.memory_allocated(device) / (1024 ** 3)
+    return 0.0
 
 
 # 定义一个函数来进行推理，并计算推理时间
-def perform_inference(model, tokenizer, devic, question):
+def perform_inference(model, tokenizer, question):
     inputs = tokenizer(question, return_tensors="pt", padding=True, truncation=True).to(device)
     attention_mask = inputs["attention_mask"]
 

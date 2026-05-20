@@ -303,8 +303,7 @@ def main():
         # Only log on main process
         if is_main_process:
             trainer.save_model(training_args.output_dir)
-
-    trainer.generate_completions()
+        trainer.generate_completions()
 
 
 if __name__ == "__main__":

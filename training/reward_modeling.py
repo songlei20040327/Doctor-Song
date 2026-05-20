@@ -32,6 +32,16 @@ from transformers.trainer import TRAINING_ARGS_NAME
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from training.template import get_conv_template
 from training.tool_utils import get_tool_utils, FunctionCall
+from training.utils import (
+    SavePeftModelTrainer,
+    save_model,
+    save_model_zero3,
+    print_trainable_parameters,
+    find_all_linear_names,
+    setup_tokenizer,
+    build_quantization_config,
+    load_jsonl_datasets,
+)
 
 
 
@@ -281,60 +291,6 @@ class RewardTrainer(Trainer):
         self.model.save_pretrained(output_dir)
 
 
-def save_model(model, tokenizer, args):
-    """Save the model and the tokenizer."""
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Take care of distributed/parallel training
-    model_to_save = model.module if hasattr(model, "module") else model
-    model_to_save.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-
-
-class CastOutputToFloat(torch.nn.Sequential):
-    """Cast the output of the model to float"""
-
-    def forward(self, x):
-        return super().forward(x).to(torch.float32)
-
-
-def print_trainable_parameters(model):
-    """
-    Prints the number of trainable parameters in the model.
-    """
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    logger.info(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
-    )
-
-
-def find_all_linear_names(peft_model, int4=False, int8=False):
-    cls = torch.nn.Linear
-    if int4 or int8:
-        import bitsandbytes as bnb
-        if int4:
-            cls = bnb.nn.Linear4bit
-        elif int8:
-            cls = bnb.nn.Linear8bitLt
-    lora_module_names = set()
-    for name, module in peft_model.named_modules():
-        if isinstance(module, cls):
-            # last layer is not add to lora_module_names
-            if 'lm_head' in name:
-                continue
-            if 'score' in name:
-                continue
-            names = name.split('.')
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-    return sorted(lora_module_names)
-
-
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments, ScriptArguments))
     model_args, data_args, training_args, script_args = parser.parse_args_into_dataclasses()
@@ -395,24 +351,7 @@ def main():
     prompt_template = None
     if script_args.template_name:
         prompt_template = get_conv_template(script_args.template_name)
-    if tokenizer.eos_token_id is None:
-        if prompt_template:
-            tokenizer.eos_token = prompt_template.stop_str
-        else:
-            tokenizer.eos_token = "</s>"
-        tokenizer.add_special_tokens({"eos_token": tokenizer.eos_token})
-        logger.info(f"Add eos_token: {tokenizer.eos_token}, eos_token_id: {tokenizer.eos_token_id}")
-    if tokenizer.bos_token_id is None:
-        tokenizer.add_special_tokens({"bos_token": tokenizer.eos_token})
-        tokenizer.bos_token_id = tokenizer.eos_token_id
-        logger.info(f"Add bos_token: {tokenizer.bos_token}, bos_token_id: {tokenizer.bos_token_id}")
-    if tokenizer.pad_token_id is None:
-        if tokenizer.unk_token_id is not None:
-            tokenizer.pad_token = tokenizer.unk_token
-        else:
-            tokenizer.pad_token = tokenizer.eos_token
-        logger.info(f"Add pad_token: {tokenizer.pad_token}, pad_token_id: {tokenizer.pad_token_id}")
-    logger.debug(f"Tokenizer: {tokenizer}")
+    setup_tokenizer(tokenizer, prompt_template)
 
     if script_args.use_peft:
         logger.info("Fine-tuning method: LoRA(PEFT)")
@@ -708,7 +647,7 @@ def main():
         if trainer.is_world_process_zero():
             logger.debug(f"Training metrics: {metrics}")
             logger.info(f"Saving model checkpoint to {training_args.output_dir}")
-            save_model(model, tokenizer, training_args)
+            save_model(model, tokenizer, training_args.output_dir)
 
     # Evaluation
     if training_args.do_eval:

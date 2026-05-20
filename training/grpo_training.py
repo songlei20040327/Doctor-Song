@@ -14,6 +14,18 @@ from loguru import logger
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.integrations import is_deepspeed_zero3_enabled
+
+from training.utils import (
+    SavePeftModelTrainer,
+    save_model,
+    save_model_zero3,
+    print_trainable_parameters,
+    find_all_linear_names,
+    setup_tokenizer,
+    build_quantization_config,
+    load_jsonl_datasets,
+)
+
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, TrlParser
 from peft import LoraConfig, TaskType, get_peft_model
 from latex2sympy2_extended import NormalizationConfig
@@ -21,7 +33,6 @@ from math_verify import LatexExtractionConfig, parse, verify
 
 os.environ["TOKENIZERS_PARALLELISM"] = "FALSE"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 
 @dataclass
 class ScriptArguments:
@@ -48,7 +59,6 @@ class ScriptArguments:
     # QLoRA arguments
     qlora: bool = field(default=False, metadata={"help": "Whether to use qlora"})
 
-
 def normalize_text(text):
     """Normalize text by removing extra whitespace, converting to lowercase."""
     if text is None:
@@ -56,7 +66,6 @@ def normalize_text(text):
     # Remove extra whitespace and convert to lowercase
     text = re.sub(r'\s+', ' ', text.strip().lower())
     return text
-
 
 def extract_answer(text):
     """Extract content between <answer> tags."""
@@ -66,7 +75,6 @@ def extract_answer(text):
     if match:
         return match.group(1).strip()
     return text.strip()
-
 
 def accuracy_reward(completions, answer, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
@@ -115,7 +123,6 @@ def accuracy_reward(completions, answer, **kwargs):
     logger.debug(f'accuracy rewards: {rewards}')
     return rewards
 
-
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
     pattern = r"<think>.*?</think><answer>.*?</answer>$"
@@ -126,7 +133,6 @@ def format_reward(completions, **kwargs):
     logger.debug(f'format rewards: {rewards}')
     return rewards
 
-
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
     "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
@@ -134,35 +140,11 @@ SYSTEM_PROMPT = (
     "<think> reasoning process here </think><answer> answer here </answer>"
 )
 
-
 def get_checkpoint(training_args: GRPOConfig):
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir):
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
     return last_checkpoint
-
-
-def find_all_linear_names(peft_model, int4=False, int8=False):
-    """Find all linear layer names in the model. reference from qlora paper."""
-    cls = torch.nn.Linear
-    if int4 or int8:
-        import bitsandbytes as bnb
-        if int4:
-            cls = bnb.nn.Linear4bit
-        elif int8:
-            cls = bnb.nn.Linear8bitLt
-    lora_module_names = set()
-    for name, module in peft_model.named_modules():
-        if isinstance(module, cls):
-            # last layer is not add to lora_module_names
-            if 'lm_head' in name:
-                continue
-            if 'output_layer' in name:
-                continue
-            names = name.split('.')
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-    return sorted(lora_module_names)
-
 
 def grpo_train(
         model_args: ModelConfig, script_args: ScriptArguments, training_args: GRPOConfig
@@ -270,8 +252,6 @@ def grpo_train(
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=model_args.load_in_4bit,
             load_in_8bit=model_args.load_in_8bit,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch_dtype,
         )
 
@@ -451,14 +431,12 @@ def grpo_train(
     if is_main_process:
         logger.info("*** Training complete! ***")
 
-
 def main():
     parser = TrlParser((ModelConfig, ScriptArguments, GRPOConfig))
     model_args, script_args, training_args = parser.parse_args_and_config()
 
     # Run the main training loop
     grpo_train(model_args, script_args, training_args)
-
 
 if __name__ == "__main__":
     main()

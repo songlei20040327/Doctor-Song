@@ -23,6 +23,17 @@ from transformers import (
     BitsAndBytesConfig,
 )
 from transformers.integrations import is_deepspeed_zero3_enabled
+
+from training.utils import (
+    SavePeftModelTrainer,
+    save_model,
+    save_model_zero3,
+    print_trainable_parameters,
+    find_all_linear_names,
+    setup_tokenizer,
+    build_quantization_config,
+    load_jsonl_datasets,
+)
 from trl import DPOConfig, DPOTrainer
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from training.template import get_conv_template
@@ -30,7 +41,6 @@ from training.tool_utils import get_tool_utils, FunctionCall
 
 os.environ["TOKENIZERS_PARALLELISM"] = "FALSE"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 
 @dataclass
 class ScriptArguments:
@@ -168,7 +178,6 @@ class ScriptArguments:
         if self.model_name_or_path is None:
             raise ValueError("You must specify a valid model_name_or_path to run training.")
 
-
 def print_trainable_parameters(model):
     """
     Prints the number of trainable parameters in the model.
@@ -182,7 +191,6 @@ def print_trainable_parameters(model):
     logger.info(
         f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
     )
-
 
 def find_all_linear_names(peft_model, int4=False, int8=False):
     """Find all linear layer names in the model. reference from qlora paper."""
@@ -204,7 +212,6 @@ def find_all_linear_names(peft_model, int4=False, int8=False):
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
     return sorted(lora_module_names)
-
 
 def main():
     parser = HfArgumentParser(ScriptArguments)
@@ -231,24 +238,7 @@ def main():
     prompt_template = None
     if args.template_name:
         prompt_template = get_conv_template(args.template_name)
-    if tokenizer.eos_token_id is None:
-        if prompt_template:
-            tokenizer.eos_token = prompt_template.stop_str
-        else:
-            tokenizer.eos_token = "</s>"
-        tokenizer.add_special_tokens({"eos_token": tokenizer.eos_token})
-        logger.info(f"Add eos_token: {tokenizer.eos_token}, eos_token_id: {tokenizer.eos_token_id}")
-    if tokenizer.bos_token_id is None:
-        tokenizer.add_special_tokens({"bos_token": tokenizer.eos_token})
-        tokenizer.bos_token_id = tokenizer.eos_token_id
-        logger.info(f"Add bos_token: {tokenizer.bos_token}, bos_token_id: {tokenizer.bos_token_id}")
-    if tokenizer.pad_token_id is None:
-        if tokenizer.unk_token_id is not None:
-            tokenizer.pad_token = tokenizer.unk_token
-        else:
-            tokenizer.pad_token = tokenizer.eos_token
-        logger.info(f"Add pad_token: {tokenizer.pad_token}, pad_token_id: {tokenizer.pad_token_id}")
-    logger.debug(f"Tokenizer: {tokenizer}")
+    setup_tokenizer(tokenizer, prompt_template)
 
     # Get datasets
     if args.dataset_name is not None:
@@ -627,7 +617,6 @@ def main():
         trainer.save_metrics("eval", metrics)
         if trainer.is_world_process_zero():
             logger.debug(f"Eval metrics: {metrics}")
-
 
 if __name__ == "__main__":
     main()

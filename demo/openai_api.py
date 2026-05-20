@@ -4,6 +4,7 @@
 #   python openai_api.py
 # Visit http://localhost:8000/docs for documents.
 
+import asyncio
 import base64
 import copy
 import json
@@ -367,6 +368,9 @@ def parse_response(response):
 def prepare_chat(tokenizer, query, history, system):
     """Prepare model inputs for chat completion."""
     if prompt_template:
+        # 把自定义 system prompt 包装成 Qwen 格式，否则模型收不到
+        if system:
+            system = f"<|im_start|>system\n{system}<|im_end|>\n"
         history_messages = history + [[query, ""]]
         prompt = prompt_template.get_prompt(messages=history_messages, system_prompt=system)
     else:
@@ -426,12 +430,13 @@ async def create_chat_completion(request: ChatCompletionRequest):
         if request.temperature < 0.01:
             gen_kwargs['top_k'] = 1  # greedy decoding
         else:
-            # Not recommended. Please tune top_p instead.
             gen_kwargs['temperature'] = request.temperature
     if request.top_p is not None:
         gen_kwargs['top_p'] = request.top_p
-    if request.max_length is not None:
-        gen_kwargs['max_length'] = request.max_length
+    # max_length/max_tokens: 默认 1024，用 max_new_tokens 避免被超长 prompt 吃掉
+    gen_kwargs['max_new_tokens'] = request.max_length if request.max_length else 1024
+    # 防止重复生成（Qwen 模型常见问题）
+    gen_kwargs['repetition_penalty'] = 1.05
 
     stop_words = add_extra_stop_words(request.stop)
     if request.tools:
@@ -501,6 +506,11 @@ def jsonify(data: BaseModel) -> str:
         return data.json(exclude_unset=True, ensure_ascii=False)
 
 
+def _sse_chunk(data):
+    """Format as SSE: data: {json}\n\n"""
+    return f"data: {data}\n\n"
+
+
 async def stream_chat_completion(
         query: str,
         history: List[List[str]],
@@ -509,39 +519,69 @@ async def stream_chat_completion(
         gen_kwargs: Dict,
         system: str,
 ):
-    """Generate chat completion in stream mode."""
+    """Generate chat completion in stream mode (SSE format).
+
+    Uses asyncio.Queue to properly interleave token generation with
+    the async event loop, so each SSE chunk is sent to the client
+    as soon as it's produced (not buffered until completion).
+    """
     global model, tokenizer
+
+    # initial delta with role
     choice_data = ChatCompletionResponseStreamChoice(
         index=0, delta=DeltaMessage(role='assistant', content=""), finish_reason=None)
     chunk = ChatCompletionStreamResponse(model=model_id, choices=[choice_data])
-    yield jsonify(chunk)
+    yield _sse_chunk(jsonify(chunk))
 
-    stop_words = [x for x in stop_words if x]
-    response_generator = stream_model_chat(
-        model,
-        tokenizer,
-        query,
-        history,
-        gen_kwargs,
-        system
-    )
-    for token_output in response_generator:
-        # Check if any stop word is in the token output
-        if any(stop_word in token_output for stop_word in stop_words):
+    # queue for producer (background thread) → consumer (this async gen)
+    token_queue: asyncio.Queue = asyncio.Queue()
+
+    def _producer():
+        """Run model.generate in background thread; push tokens into queue."""
+        try:
+            model_inputs = prepare_chat(tokenizer, query, history, system).to(model.device)
+            gkwargs = dict(gen_kwargs)
+            gkwargs.pop('inputs', None)
+            gkwargs.pop('streamer', None)
+
+            streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+            gkwargs['streamer'] = streamer
+            gkwargs['inputs'] = model_inputs.input_ids
+
+            thread = Thread(target=model.generate, kwargs=gkwargs, daemon=True)
+            thread.start()
+
+            for token_str in streamer:
+                token_queue.put_nowait(token_str)
+        except Exception as e:
+            logger.error(f"Stream generation error: {e}")
+        finally:
+            token_queue.put_nowait(None)  # sentinel
+
+    Thread(target=_producer, daemon=True).start()
+
+    stop_words = [x for x in (stop_words or []) if x]
+
+    while True:
+        token_str = await token_queue.get()
+        if token_str is None:
+            break  # generation done
+
+        if stop_words and any(sw in token_str for sw in stop_words):
             break
 
-        # Send the current token as part of the response
         choice_data = ChatCompletionResponseStreamChoice(
-            index=0, delta=DeltaMessage(content=token_output), finish_reason=None)
+            index=0, delta=DeltaMessage(content=token_str), finish_reason=None)
         chunk = ChatCompletionStreamResponse(model=model_id, choices=[choice_data])
-        yield jsonify(chunk)
+        yield _sse_chunk(jsonify(chunk))
 
+    # final chunk with finish_reason
     choice_data = ChatCompletionResponseStreamChoice(
         index=0, delta=DeltaMessage(), finish_reason='stop'
     )
     chunk = ChatCompletionStreamResponse(model=model_id, choices=[choice_data])
-    yield jsonify(chunk)
-    yield '[DONE]'
+    yield _sse_chunk(jsonify(chunk))
+    yield 'data: [DONE]\n\n'
 
     _gc()
 
@@ -574,18 +614,23 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
         trust_remote_code=True,
-        resume_download=True,
     )
 
-    if args.cpu_only:
-        device_map = 'cpu'
+    if args.cpu_only or not torch.cuda.is_available():
+        if torch.backends.mps.is_available():
+            device_map = 'mps'
+            torch_dtype = torch.float16
+        else:
+            device_map = 'cpu'
+            torch_dtype = torch.float32
     else:
         device_map = 'auto'
+        torch_dtype = torch.bfloat16
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         device_map=device_map,
         trust_remote_code=True,
-        resume_download=True,
+        torch_dtype=torch_dtype,
     )
     if args.lora_model:
         from peft import PeftModel
@@ -597,8 +642,11 @@ if __name__ == '__main__':
     model.generation_config = GenerationConfig.from_pretrained(
         args.base_model,
         trust_remote_code=True,
-        resume_download=True,
     )
+    # Qwen 模型 pad_token 和 eos_token 相同，显式设置避免警告
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
     if args.template_name:
         import sys, os
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'training'))

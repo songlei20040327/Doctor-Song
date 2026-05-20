@@ -49,6 +49,15 @@ from transformers.utils.versions import require_version
 from transformers.integrations import is_deepspeed_zero3_enabled
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from training.tool_utils import get_tool_utils, FunctionCall, load_local_json_datasets
+from training.utils import (
+    SavePeftModelTrainer,
+    save_model,
+    save_model_zero3,
+    print_trainable_parameters,
+    find_all_linear_names,
+    setup_tokenizer,
+    build_quantization_config,
+)
 from training.template import get_conv_template
 try:
     import flash_attn  # noqa: F401
@@ -220,114 +229,6 @@ class ScriptArguments:
             raise ValueError("You must specify a valid model_max_length >= 60 to run training")
 
 
-class SavePeftModelTrainer(Trainer):
-    """
-    Trainer for lora models
-    """
-
-    def save_model(self, output_dir=None, _internal_call=False):
-        """Save the LoRA model."""
-        os.makedirs(output_dir, exist_ok=True)
-        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
-        self.model.save_pretrained(output_dir)
-
-
-def save_model(model, tokenizer, args):
-    """Save the model and the tokenizer."""
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Take care of distributed/parallel training
-    model_to_save = model.module if hasattr(model, "module") else model
-    model_to_save.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-
-
-def save_model_zero3(model, tokenizer, args, trainer):
-    """Save the model for deepspeed zero3.
-    refer https://github.com/lm-sys/FastChat/blob/main/fastchat/train/train_lora.py#L209
-    """
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-    state_dict_zero3 = trainer.model_wrapped._zero3_consolidated_16bit_state_dict()
-    model_to_save = model.module if hasattr(model, "module") else model
-    model_to_save.save_pretrained(args.output_dir, state_dict=state_dict_zero3)
-    tokenizer.save_pretrained(output_dir)
-
-
-def print_trainable_parameters(model):
-    """
-    Prints the number of trainable parameters in the model.
-    """
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    print(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
-    )
-
-
-def find_all_linear_names(peft_model, int4=False, int8=False):
-    """Find all linear layer names in the model. reference from qlora paper."""
-    cls = torch.nn.Linear
-    if int4 or int8:
-        import bitsandbytes as bnb
-        if int4:
-            cls = bnb.nn.Linear4bit
-        elif int8:
-            cls = bnb.nn.Linear8bitLt
-    lora_module_names = set()
-    for name, module in peft_model.named_modules():
-        if isinstance(module, cls):
-            # last layer is not add to lora_module_names
-            if 'lm_head' in name:
-                continue
-            if 'output_layer' in name:
-                continue
-            names = name.split('.')
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-    return sorted(lora_module_names)
-
-
-def check_and_optimize_memory():
-    """检查并优化GPU内存使用"""
-    if not torch.cuda.is_available():
-        return
-
-    logger.info("🔍 检查GPU内存状态...")
-
-    # 清理缓存
-    torch.cuda.empty_cache()
-
-    # 检查每个GPU的内存状态
-    num_gpus = torch.cuda.device_count()
-    for i in range(num_gpus):
-        props = torch.cuda.get_device_properties(i)
-        total_memory = props.total_memory / 1024 ** 3
-        allocated = torch.cuda.memory_allocated(i) / 1024 ** 3
-        cached = torch.cuda.memory_reserved(i) / 1024 ** 3
-        free = total_memory - allocated - cached
-
-        logger.info(f"GPU {i} ({props.name}):")
-        logger.info(f"  总内存: {total_memory:.1f}GB")
-        logger.info(f"  已分配: {allocated:.1f}GB")
-        logger.info(f"  已缓存: {cached:.1f}GB")
-        logger.info(f"  可用: {free:.1f}GB")
-
-    # 设置内存优化选项
-    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
-        torch.backends.cuda.enable_flash_sdp(True)
-        logger.info("✅ 启用Flash Attention优化")
-
-    # 启用内存高效的注意力机制
-    if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
-        torch.backends.cuda.enable_mem_efficient_sdp(True)
-        logger.info("✅ 启用内存高效注意力机制")
-
-
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, Seq2SeqTrainingArguments, ScriptArguments))
 
@@ -374,24 +275,7 @@ def main():
     prompt_template = None
     if script_args.template_name:
         prompt_template = get_conv_template(script_args.template_name)
-    if tokenizer.eos_token_id is None:
-        if prompt_template:
-            tokenizer.eos_token = prompt_template.stop_str
-        else:
-            tokenizer.eos_token = "</s>"
-        tokenizer.add_special_tokens({"eos_token": tokenizer.eos_token})
-        logger.info(f"Add eos_token: {tokenizer.eos_token}, eos_token_id: {tokenizer.eos_token_id}")
-    if tokenizer.bos_token_id is None:
-        tokenizer.add_special_tokens({"bos_token": tokenizer.eos_token})
-        tokenizer.bos_token_id = tokenizer.eos_token_id
-        logger.info(f"Add bos_token: {tokenizer.bos_token}, bos_token_id: {tokenizer.bos_token_id}")
-    if tokenizer.pad_token_id is None:
-        if tokenizer.unk_token_id is not None:
-            tokenizer.pad_token = tokenizer.unk_token
-        else:
-            tokenizer.pad_token = tokenizer.eos_token
-        logger.info(f"Add pad_token: {tokenizer.pad_token}, pad_token_id: {tokenizer.pad_token_id}")
-    logger.debug(f"Tokenizer: {tokenizer}")
+    setup_tokenizer(tokenizer, prompt_template)
 
     IGNORE_INDEX = LabelSmoother.ignore_index if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
 
@@ -714,28 +598,10 @@ def main():
 
         load_in_4bit = model_args.load_in_4bit
         load_in_8bit = model_args.load_in_8bit
-        quantization_config = None
-        if load_in_4bit and load_in_8bit:
-            raise ValueError("Error, load_in_4bit and load_in_8bit cannot be set at the same time")
-        elif load_in_8bit or load_in_4bit:
-            logger.info(f"Quantizing model, load_in_4bit: {load_in_4bit}, load_in_8bit: {load_in_8bit}")
+        quantization_config = build_quantization_config(load_in_4bit, load_in_8bit, torch_dtype, script_args.qlora)
+        if quantization_config is not None:
             if is_deepspeed_zero3_enabled():
                 raise ValueError("DeepSpeed ZeRO-3 is incompatible with quantization.")
-            if load_in_8bit:
-                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-            elif load_in_4bit:
-                if script_args.qlora:
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch_dtype,
-                        bnb_4bit_use_double_quant=True,
-                        bnb_4bit_quant_type="nf4"
-                    )
-                else:
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch_dtype,
-                    )
 
         model_kwargs = {
             "config": config,
@@ -973,9 +839,9 @@ def main():
             logger.debug(f"Training metrics: {metrics}")
             logger.info(f"Saving model checkpoint to {training_args.output_dir}")
             if is_deepspeed_zero3_enabled():
-                save_model_zero3(model, tokenizer, training_args, trainer)
+                save_model_zero3(model, tokenizer, training_args.output_dir, trainer)
             else:
-                save_model(model, tokenizer, training_args)
+                save_model(model, tokenizer, training_args.output_dir)
 
     # Evaluation
     if training_args.do_eval:

@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Doctor.Song - 医学AI助手</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #1a1a2e; color: #eee; height: 100vh; display: flex; flex-direction: column; }
+.header { background: linear-gradient(135deg, #0f3460, #16213e); padding: 16px 24px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #0f3460; }
+.header .logo { width: 36px; height: 36px; background: #e94560; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.header span { font-size: 12px; color: #a0a0b8; }
+.chat { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+.msg { display: flex; gap: 12px; max-width: 800px; margin: 0 auto; width: 100%; }
+.msg.user { flex-direction: row-reverse; }
+.avatar { width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 14px; }
+.msg.user .avatar { background: #e94560; }
+.msg.assistant .avatar { background: #0f3460; }
+.bubble { padding: 12px 16px; border-radius: 12px; line-height: 1.6; font-size: 14px; }
+.msg.user .bubble { background: #e94560; color: #fff; border-bottom-right-radius: 4px; }
+.msg.assistant .bubble { background: #16213e; border: 1px solid #0f3460; border-bottom-left-radius: 4px; }
+.bubble p { margin: 8px 0; }
+.bubble p:first-child { margin-top: 0; }
+.bubble p:last-child { margin-bottom: 0; }
+.bubble ul, .bubble ol { margin: 8px 0; padding-left: 20px; }
+.bubble li { margin: 4px 0; }
+.think-block { background: #1a1a2e; border: 1px solid #0f3460; border-radius: 8px; padding: 12px; margin-bottom: 12px; cursor: pointer; }
+.think-header { font-size: 12px; color: #a0a0b8; display: flex; align-items: center; gap: 6px; }
+.think-content { margin-top: 8px; font-size: 13px; color: #888; display: none; line-height: 1.6; }
+.think-content.show { display: block; }
+.footer { padding: 16px 24px; border-top: 1px solid #0f3460; background: #16213e; }
+.input-box { max-width: 800px; margin: 0 auto; display: flex; gap: 8px; }
+.input-box textarea { flex: 1; background: #1a1a2e; border: 1px solid #0f3460; border-radius: 12px; padding: 12px 16px; color: #eee; font-size: 14px; resize: none; outline: none; font-family: inherit; min-height: 44px; max-height: 120px; }
+.input-box textarea:focus { border-color: #e94560; }
+.input-box button { background: #e94560; border: none; border-radius: 12px; padding: 12px 20px; color: #fff; cursor: pointer; font-size: 14px; font-weight: 500; }
+.input-box button:hover { background: #d63851; }
+.input-box button:disabled { opacity: 0.5; cursor: not-allowed; }
+.stream-cursor { display: inline-block; animation: blink 1s step-end infinite; color: #e94560; font-weight: bold; }
+@keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="logo">⚕</div>
+  <div><h1>Doctor.Song</h1><span>医学AI助手 · Qwen3.5-0.8B</span></div>
+</div>
+
+<div class="config-bar">
+  <label>API 地址</label>
+  <input id="apiUrl" value="http://localhost:8000/v1/chat/completions" placeholder="API URL">
+  <label>模型</label>
+  <select id="modelSelect" class="model-select">
+    <option value="doctor-song">Doctor.Song-SFT</option>
+  </select>
+  <label style="margin-left:auto;color:#888;" id="status">未连接</label>
+</div>
+
+<div class="chat" id="chat">
+  <div class="msg assistant">
+    <div class="avatar">⚕</div>
+    <div class="bubble">
+      你好！我是 <strong>Doctor.Song</strong>，一个基于 Qwen3.5-0.8B 微调的医学AI助手。<br><br>
+      我可以回答常见症状咨询、药物相关、慢性病管理、检查报告解读等方面的问题。<br><br>
+      ⚠ 我的建议仅供参考，紧急情况请立即就医。
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  <div class="input-box">
+    <textarea id="input" rows="1" placeholder="输入你的医学问题... (Enter发送，Shift+Enter换行)"></textarea>
+    <button id="sendBtn" onclick="send()">发送</button>
+  </div>
+</div>
+
+<script>
+const chat = document.getElementById('chat');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('sendBtn');
+const status = document.getElementById('status');
+
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function renderMarkdown(text) {
+  // 处理 <think> 块
+  text = text.replace(/<think>/g, '<div class="think-block"><div class="think-header" onclick="this.nextElementSibling.classList.toggle(\'show\')">💭 思考过程 ▼</div><div class="think-content show">');
+  text = text.replace(/<\/think>/g, '</div></div>');
+  // 简单markdown
+  text = text.replace(/^### (.+)/gm, '<strong>$1</strong>');
+  text = text.replace(/^## (.+)/gm, '<strong>$1</strong>');
+  text = text.replace(/^# (.+)/gm, '<strong>$1</strong>');
+  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  text = text.replace(/^- (.+)/gm, '<li>$1</li>');
+  text = text.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+  text = text.replace(/^\d+\.\s(.+)/gm, '<li>$1</li>');
+  text = text.replace(/\n\n/g, '</p><p>');
+  text = text.replace(/\n/g, '<br>');
+  return '<p>' + text + '</p>';
+}
+
+function addMessage(role, content, isHtml = false) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.innerHTML = `
+    <div class="avatar">${role === 'user' ? '👤' : '⚕'}</div>
+    <div class="bubble">${isHtml ? content : renderMarkdown(content)}</div>
+  `;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function createStreamingMessage() {
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.id = 'streaming-msg';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.id = 'streaming-bubble';
+  bubble.innerHTML = '<span class="stream-cursor">▊</span>';
+  div.innerHTML = '<div class="avatar">⚕</div>';
+  div.appendChild(bubble);
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return { div, bubble };
+}
+
+function removeCursor() {
+  const cursor = document.querySelector('.stream-cursor');
+  if (cursor) cursor.remove();
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text) return;
+  addMessage('user', text);
+  input.value = '';
+  sendBtn.disabled = true;
+
+  // 流式输出占位
+  const { div, bubble } = createStreamingMessage();
+  let fullText = '';
+
+  try {
+    const apiUrl = document.getElementById('apiUrl').value;
+    const model = document.getElementById('modelSelect').value;
+    const resp = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: model,
+        messages: [
+          { role: 'system', content: '你是 Doctor.Song，一位专业的医学AI助手。请给出准确、安全的医学建议。如果问题超出知识范围或涉及紧急情况，请建议就医。' },
+          { role: 'user', content: text }
+        ],
+        max_length: 1024,
+        temperature: 0.7,
+        stream: true,
+      })
+    });
+
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+    }
+
+    // SSE 流式解析
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(data);
+            const token = parsed.choices?.[0]?.delta?.content || '';
+            if (token) {
+              fullText += token;
+              bubble.innerHTML = renderMarkdown(fullText) + '<span class="stream-cursor">▊</span>';
+              chat.scrollTop = chat.scrollHeight;
+            }
+          } catch(e) {}
+        }
+      }
+    }
+
+    removeCursor();
+    bubble.innerHTML = renderMarkdown(fullText);
+    status.textContent = '已连接';
+    div.removeAttribute('id');
+    bubble.removeAttribute('id');
+  } catch(e) {
+    removeCursor();
+    div.remove();
+    addMessage('assistant', '❌ 连接失败：' + e.message + '\n请确认API服务已启动。');
+    status.textContent = '连接失败';
+  }
+  sendBtn.disabled = false;
+  input.focus();
+}
+</script>
+</body>
+</html>

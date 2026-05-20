@@ -133,4 +133,28 @@ dmypy.json
 .cache/
 outputs-dpo-qwen-v1/
 cache/
+outputs/
 outputs-*/
+eval_results/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Claude Code
+.claude/
+
+# Training logs
+training_timeline.log
+
+# Evaluation reports (private)
+Doctor_Song_评测报告.md
+简历项目量化评测报告.md
